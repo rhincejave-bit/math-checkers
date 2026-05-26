@@ -24,7 +24,7 @@ A Python desktop game that combines classic Checkers with Math Challenges. To ca
 
 ## 📸 Screenshot
 
-> *(Add a screenshot of your game here!)*
+> ![Screenshot](Screenshot%202026-05-26%20182857.png)
 
 ---
 
