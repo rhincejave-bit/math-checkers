@@ -1,0 +1,26 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments (don't upload these — they're huge)
+venv/
+.venv/
+env/
+
+# VS Code settings (personal to your machine)
+.vscode/
+
+# Runtime files (generated when the game runs)
+savegame.json
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
