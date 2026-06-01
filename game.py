@@ -13,6 +13,7 @@ from piece import WHITE, BLACK
 from mathgen import generate_question, MathQuestion
 from ai import AI
 import savegame
+import random
 print("✅ USING THIS game.py FILE")
 
 
@@ -20,20 +21,21 @@ Coord = Tuple[int, int]
 
 
 class GameState:
-    def __init__(self, mode="ai", ai_difficulty=2, math_ops=None, timed_mode=False, time_limit=0.0):
+    def __init__(self, mode="ai", ai_difficulty=2, math_ops=None, timed_mode=False, time_limit=0.0, game_mode="classic"):
         if math_ops is None:
             math_ops = ["add", "sub"]
 
         self.mode = mode
         self.ai_difficulty = ai_difficulty
-        self.math_ops = math_ops      # ✅ REQUIRED — add this line
+        self.math_ops = math_ops
+        self.game_mode = game_mode  # "classic" or "enhanced"
 
         self.options = {
             "math_ops": math_ops,
             "timed_mode": timed_mode,
             "time_limit": time_limit,
             "ai_difficulty": ai_difficulty,
-}
+        }
 
         self.timed_mode = timed_mode
         self.time_limit = time_limit
@@ -47,16 +49,88 @@ class GameState:
         self.scores = {"W": 0, "B": 0}
         self.ai = None
 
-        # If mode is AI, create an AI playing the opposite color to the starting turn.
-        # Default: human plays the current `self.turn`, AI plays opposite.
+        # Enhanced mode state
+        self.ability_cards = {"W": {}, "B": {}}
+        self.special_pieces = {}   # pos -> "wild" | "power"
+        self.combo_streak = {"W": 0, "B": 0}
+        self.ai_frozen_turns = 0
+        self.pending_double = False  # double-points card queued
+        self.chain_capture_pos = None  # position for chain capture
+
         if self.mode == "ai":
             try:
                 from ai import AI
-                ai_color = "W" if self.turn == "B" else "B"  # AI plays the opposite
+                ai_color = "W" if self.turn == "B" else "B"
                 self.ai = AI(color=ai_color, difficulty=self.ai_difficulty)
             except Exception as e:
                 print("⚠️ Failed to create AI in GameState __init__:", e)
                 self.ai = None
+
+        if self.game_mode == "enhanced":
+            self._init_enhanced()
+
+    # --------------------------------------------------------------
+    # Enhanced Mode Setup
+    # --------------------------------------------------------------
+    def _init_enhanced(self):
+        """Set up ability cards and special pieces for Enhanced mode."""
+        self.ability_cards = {
+            "W": {"skip": 2, "double": 1, "freeze": 1},
+            "B": {"skip": 2, "double": 1, "freeze": 1},
+        }
+        self._assign_special_pieces()
+
+    def _assign_special_pieces(self):
+        """Randomly mark 2 wild + 2 power pieces per side."""
+        self.special_pieces = {}
+        for color in ["W", "B"]:
+            pieces = self.board.all_pieces(color)
+            if len(pieces) >= 4:
+                chosen = random.sample(pieces, 4)
+                for i, pos in enumerate(chosen):
+                    piece = self.board.get(pos)
+                    if piece:
+                        stype = "wild" if i < 2 else "power"
+                        piece.special = stype
+                        self.special_pieces[pos] = stype
+
+    def _move_special(self, frm, to, captured_pos=None):
+        """Update special_pieces tracking when a piece moves or is captured."""
+        if frm in self.special_pieces:
+            self.special_pieces[to] = self.special_pieces.pop(frm)
+        if captured_pos and captured_pos in self.special_pieces:
+            del self.special_pieces[captured_pos]
+
+    def use_ability(self, player: str, card: str) -> Dict:
+        """Use an ability card. Returns {"valid", "message", "effect"}."""
+        if self.game_mode != "enhanced":
+            return {"valid": False, "message": "Enhanced mode only"}
+        cards = self.ability_cards.get(player, {})
+        if cards.get(card, 0) <= 0:
+            return {"valid": False, "message": f"No {card} cards left!"}
+        self.ability_cards[player][card] -= 1
+        if card == "freeze":
+            self.ai_frozen_turns = 3
+            return {"valid": True, "message": "❄️ AI frozen for 3 turns!", "effect": "freeze"}
+        if card == "double":
+            self.pending_double = True
+            return {"valid": True, "message": "💎 Next capture scores 2×!", "effect": "double"}
+        if card == "skip":
+            return {"valid": True, "message": "⚡ Question skipped!", "effect": "skip"}
+        return {"valid": False, "message": "Unknown card"}
+
+    def check_chain_capture(self, pos) -> bool:
+        """Check if the piece at pos can make another capture."""
+        if self.game_mode != "enhanced":
+            return False
+        r, c = pos
+        for dr in [-1, 1]:
+            for dc in [-1, 1]:
+                target = (r + dr * 2, c + dc * 2)
+                res = self.board.try_move(pos, target)
+                if res.get("valid") and res.get("capture"):
+                    return True
+        return False
 
     # --------------------------------------------------------------
     # Utility and state management
@@ -68,6 +142,12 @@ class GameState:
         self.move_count = 0
         self.capture_count = 0
         self.scores = {"W": 0, "B": 0}
+        self.combo_streak = {"W": 0, "B": 0}
+        self.ai_frozen_turns = 0
+        self.pending_double = False
+        self.chain_capture_pos = None
+        if self.game_mode == "enhanced":
+            self._init_enhanced()
 
     def push_undo(self):
         self.undo_stack.append({
@@ -153,10 +233,10 @@ class GameState:
     # --------------------------------------------------------------
     # Main move logic (with math check)
     # --------------------------------------------------------------
-    def make_move_with_math(self, frm, to, player_response: str, q: Optional[MathQuestion] = None):
+    def make_move_with_math(self, frm, to, player_response: str, q: Optional[MathQuestion] = None, skip_question: bool = False):
         """
         Apply a move that may require a math question to capture.
-        `q` is optional: if provided, it will be used; otherwise the question is generated.
+        Enhanced mode: supports wild/power pieces, double card, chain captures.
         Returns a dict {"valid": bool, "message": str}
         """
         try:
@@ -168,68 +248,108 @@ class GameState:
             if not res_try["valid"]:
                 return {"valid": False, "message": res_try["message"]}
 
-            # If this is a capture move, ensure we have a MathQuestion
             if res_try.get("capture"):
-                # use provided question if UI passed it; otherwise generate from board
-                question = q if q is not None else self.get_math_question_for_move(frm, to)
-                if not question:
-                    return {"valid": False, "message": "No math question generated"}
+                # Enhanced: wild piece auto-captures without question
+                is_wild = self.game_mode == "enhanced" and self.special_pieces.get(frm) == "wild"
+                is_power = self.game_mode == "enhanced" and self.special_pieces.get(frm) == "power"
 
-                # Defensive: make sure player_response is a non-empty string
-                player_resp_str = "" if player_response is None else str(player_response).strip()
-                if player_resp_str == "":
-                    return {"valid": False, "message": "No answer entered"}
+                if not is_wild and not skip_question:
+                    question = q if q is not None else self.get_math_question_for_move(frm, to)
+                    if not question:
+                        return {"valid": False, "message": "No math question generated"}
 
-                # Try checking the answer, but catch exceptions from MathQuestion.check
-                try:
-                    ok = question.check(player_resp_str)
-                except Exception as ex:
-                    # Print full debug info to console for diagnosis
-                    print("DEBUG: Exception while checking math answer:")
-                    import traceback
-                    traceback.print_exc()
-                    return {"valid": False, "message": f"Error validating answer: {ex}"}
+                    player_resp_str = "" if player_response is None else str(player_response).strip()
+                    if player_resp_str == "":
+                        return {"valid": False, "message": "No answer entered"}
 
-                if ok:
-                    # ✅ correct → perform capture and award score
-                    self.push_undo()
-                    self.board.apply_move(frm, to)
+                    try:
+                        ok = question.check(player_resp_str)
+                    except Exception as ex:
+                        import traceback; traceback.print_exc()
+                        return {"valid": False, "message": f"Error validating answer: {ex}"}
+
+                    if not ok:
+                        self.combo_streak[self.turn] = 0
+                        self.turn = WHITE if self.turn == BLACK else BLACK
+                        return {"valid": False, "message": "Wrong answer! Enemy's turn"}
+                else:
+                    # Wild/skip — create a dummy "question" with answer=0 for score
+                    question = None
+
+                # ✅ Correct / wild / skipped — apply capture
+                self.push_undo()
+                captured_pos = res_try.get("capture")
+                self.board.apply_move(frm, to)
+
+                # Score calculation
+                if question:
                     try:
                         safe_score = int(float(question.answer))
                     except Exception:
-                        # fallback if answer is not numeric
-                        try:
-                            safe_score = int(question.answer)
-                        except Exception:
-                            safe_score = 0
-                    # ensure scores dict has keys
-                    if not isinstance(self.scores, dict):
-                        self.scores = {"W": 0, "B": 0}
-                    self.scores[self.turn] = self.scores.get(self.turn, 0) + safe_score
-                    sign = "+" if safe_score >= 0 else ""
-                    self.move_count += 1
-                    self.capture_count += 1
-                    msg = f"Correct! {sign}{safe_score} points"
-                    # switch turn below
+                        safe_score = 0
                 else:
-                    # ❌ wrong → do not apply capture; switch turn and inform
-                    self.turn = WHITE if self.turn == BLACK else BLACK
-                    return {"valid": False, "message": "Wrong answer! Enemy's turn"}
+                    safe_score = 5 if is_wild else 0  # wild gives flat 5 pts
+
+                # Power piece doubles score
+                if is_power:
+                    safe_score *= 2
+                # Double card active
+                if self.pending_double and self.game_mode == "enhanced":
+                    safe_score *= 2
+                    self.pending_double = False
+
+                if not isinstance(self.scores, dict):
+                    self.scores = {"W": 0, "B": 0}
+                self.scores[self.turn] = self.scores.get(self.turn, 0) + safe_score
+
+                # Combo streak (Enhanced)
+                if self.game_mode == "enhanced":
+                    self.combo_streak[self.turn] = self.combo_streak.get(self.turn, 0) + 1
+                    if self.combo_streak[self.turn] >= 3:
+                        bonus = 5 * self.combo_streak[self.turn]
+                        self.scores[self.turn] += bonus
+                        safe_score += bonus
+
+                # Update special piece tracking
+                if self.game_mode == "enhanced":
+                    self._move_special(frm, to, captured_pos)
+
+                sign = "+" if safe_score >= 0 else ""
+                self.move_count += 1
+                self.capture_count += 1
+                msg = f"⚡ Wild capture! +{safe_score} pts" if is_wild else f"Correct! {sign}{safe_score} pts"
+                if is_power and not is_wild:
+                    msg = f"💎 Power! {sign}{safe_score} pts (×2)"
+
+                # Chain capture check (Enhanced)
+                if self.game_mode == "enhanced" and self.check_chain_capture(to):
+                    self.chain_capture_pos = to
+                    # Don't switch turn — player gets another capture
+                    winner = self.check_winner()
+                    return {"valid": True, "message": msg + " — CHAIN!", "applied": True,
+                            "winner": winner, "chain": True, "chain_pos": to}
+
             else:
                 # Normal move (no capture)
                 self.push_undo()
                 self.board.apply_move(frm, to)
+                if self.game_mode == "enhanced":
+                    self._move_special(frm, to)
+                    self.combo_streak[self.turn] = 0
                 self.move_count += 1
-                msg = "Moved (no capture)"
-                return {"valid": True, "message": msg, "applied": True}
+                self.chain_capture_pos = None
+                msg = "Moved"
+                self.turn = WHITE if self.turn == BLACK else BLACK
+                winner = self.check_winner()
+                return {"valid": True, "message": msg, "applied": True, "winner": winner}
 
-            # Switch turn after successful move/capture
+            # Switch turn after capture
+            self.chain_capture_pos = None
             self.turn = WHITE if self.turn == BLACK else BLACK
             winner = self.check_winner()
             return {"valid": True, "message": msg, "applied": True, "winner": winner}
 
         except Exception as e:
-            # Print stacktrace to console to help debugging (UI shows message too)
             import traceback
             print("\n=== UNEXPECTED ERROR in make_move_with_math ===")
             traceback.print_exc()
@@ -243,6 +363,13 @@ class GameState:
     def make_move_ai(self) -> Dict:
         if not self.ai or self.turn != self.ai.color:
             return {"valid": False, "message": "AI not active or not AI's turn"}
+
+        # Enhanced: AI frozen
+        if self.game_mode == "enhanced" and self.ai_frozen_turns > 0:
+            self.ai_frozen_turns -= 1
+            self.turn = "W" if self.turn == "B" else "B"
+            remaining = self.ai_frozen_turns
+            return {"valid": False, "message": f"❄️ AI frozen! ({remaining} turns left)"}
 
         chosen = self.ai.choose_move(self.board)
         if not chosen:
@@ -309,14 +436,12 @@ class GameState:
     # --------------------------------------------------------------
     def check_winner(self) -> Optional[str]:
         """
-        Returns 'W', 'B', 'draw', or None if the game is still ongoing.
-        Win conditions:
-          1. A player has no pieces remaining → opponent wins.
-          2. The current player has no valid moves → opponent wins.
+        Game ends when a player has no pieces or no valid moves.
+        Winner = player with the HIGHEST score.
+        Tie-break: more pieces remaining.
         """
         w_pieces = []
         b_pieces = []
-
         for row in range(8):
             for col in range(8):
                 piece = self.board.get((row, col))
@@ -326,38 +451,45 @@ class GameState:
                     else:
                         b_pieces.append((row, col))
 
+        game_ended = False
+
         # Condition 1: a side has no pieces left
-        if not w_pieces:
-            return BLACK  # "B"
-        if not b_pieces:
-            return WHITE  # "W"
+        if not w_pieces or not b_pieces:
+            game_ended = True
 
         # Condition 2: current player has no valid moves
-        current_pieces = w_pieces if self.turn == WHITE else b_pieces
-        has_move = False
-        for pos in current_pieces:
-            # Try all 4 diagonal directions (1 and 2 squares ahead for captures)
-            r, c = pos
-            for dr in [-1, 1]:
-                for dc in [-1, 1]:
-                    for dist in [1, 2]:
-                        target = (r + dr * dist, c + dc * dist)
-                        result = self.board.try_move(pos, target)
-                        if result.get("valid"):
-                            has_move = True
-                            break
-                    if has_move:
-                        break
-                if has_move:
-                    break
-            if has_move:
-                break
+        if not game_ended:
+            current_pieces = w_pieces if self.turn == WHITE else b_pieces
+            has_move = False
+            for pos in current_pieces:
+                r, c = pos
+                for dr in [-1, 1]:
+                    for dc in [-1, 1]:
+                        for dist in [1, 2]:
+                            target = (r + dr * dist, c + dc * dist)
+                            result = self.board.try_move(pos, target)
+                            if result.get("valid"):
+                                has_move = True
+                                break
+                        if has_move: break
+                    if has_move: break
+                if has_move: break
+            if not has_move:
+                game_ended = True
 
-        if not has_move:
-            # Current player is stuck → opponent wins
-            return BLACK if self.turn == WHITE else WHITE
+        if not game_ended:
+            return None
 
-        return None  # Game still going
+        # Winner = highest score
+        ws = self.scores.get("W", 0)
+        bs = self.scores.get("B", 0)
+        if ws > bs:
+            return WHITE
+        elif bs > ws:
+            return BLACK
+        else:
+            # Tie-break: more pieces remaining
+            return WHITE if len(w_pieces) >= len(b_pieces) else BLACK
 
     def get_winner_message(self) -> Optional[str]:
         """Returns a human-readable winner message, or None if game is ongoing."""
